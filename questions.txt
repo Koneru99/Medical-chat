@@ -1,0 +1,7 @@
+What is your age?
+Are you high-risk for contracting the Covid19/novel coronavirus infection(ex.recent contact with infected person,healthcare worker)?
+Have you been diagonsed with the novel coronavirus/COVID-19 infection?
+if yes, Please provide the date of your positive cornoaviru/COVID-19 test?
+Are you currently hospitalized or in an intensive Care Unit(ICU)?
+Are you currently pregent?
+
