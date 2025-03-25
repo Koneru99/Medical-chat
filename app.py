@@ -1,25 +1,76 @@
-import time
+import json
 
-from cohere.finetuning import FinetunedModel, Settings, BaseModel
-from flask import Flask, render_template, request, jsonify
-import cohere
-import re
-from flask import Flask, jsonify, request
+from flask import Flask, render_template, request, jsonify, session
 from flask_pymongo import PyMongo
-from thefuzz import fuzz
+import cohere
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import time
+import re
 
 app = Flask(__name__)
+
 
 # Initialize Cohere API
 co = cohere.Client('O1jRnF6ABMam4G5KRsMlKfH7qJDFypv13nLiPuMz')
 
-
 # MongoDB Connection
-app.config["MONGO_URI"] = "mongodb://localhost:27017/clinicalTrails"  # Replace 'mydatabase' with your database name
+app.config["MONGO_URI"] = "mongodb://localhost:27017/clinicalTrails"
 mongo = PyMongo(app)
 
-user_session ={}
-clinical_trails =[]
+# Precompute trial embeddings (run this once or on app startup)
+TRIAL_EMBEDDINGS = {}
+TRIAL_DATA = list(mongo.db.trails.find({}, {"_id": 0}))
+
+
+
+
+def precompute_trial_embeddings():
+    global TRIAL_EMBEDDINGS, TRIAL_DATA
+    batch_size = 10  # Process 10 trials per API call
+
+    try :
+        with open("trail_embedding.json","r") as f:
+            TRIAL_EMBEDDINGS = json.load(f)
+            f.close()
+    except Exception as e:
+        for i in range(0, len(TRIAL_DATA), batch_size):
+            batch = TRIAL_DATA[i:i + batch_size]
+            texts = []
+            print("batch Processing ...." , i)
+            for trial in batch:
+                text = " ".join([
+                    # " ".join(trial.get("protocolSection", {}).get("conditionsModule", {}).get("conditions", [])),
+                    # trial.get("protocolSection", {}).get("eligibilityModule", {}).get("gender", ""),
+                    # trial.get("protocolSection", {}).get("statusModule", {}).get("overallStatus", ""),
+                    # " ".join([loc.get("city", "") + " " + loc.get("country", "") for loc in trial.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])])
+                    str(trial)
+                ])
+                texts.append(text if text.strip() else "unknown")  # Handle empty text
+
+            try:
+                embeddings = co.embed(texts=texts, model="embed-english-v3.0", input_type="classification").embeddings
+                for j, embedding in enumerate(embeddings):
+                    TRIAL_EMBEDDINGS[i + j] = embedding
+            except cohere.errors.TooManyRequestsError:
+                print("Rate limit hit, waiting 60 seconds...")
+                time.sleep(60)  # Wait 1 minute to reset rate limit
+                embeddings = co.embed(texts=texts, model="embed-english-v3.0", input_type="search_document").embeddings
+                for j, embedding in enumerate(embeddings):
+                    TRIAL_EMBEDDINGS[i + j] = embedding
+
+            time.sleep(1.5)  # ~40 calls/minute = 1 call every 1.5 seconds
+        print(f"Precomputed embeddings for {len(TRIAL_DATA)} trials")
+
+
+precompute_trial_embeddings()
+# with open("trail_embedding.json", "w+") as f:
+#     f.write(json.dumps(TRIAL_EMBEDDINGS))
+#     f.close()
+
+
+user_info={}
+user_session ={"session_data":{}}
 # Routes
 @app.route('/')
 def chat():
@@ -27,237 +78,134 @@ def chat():
 
 @app.route('/send_message', methods=['POST'])
 def send_message():
-    global user_session
-    """Handles user messages, filters trials dynamically, and generates the next question."""
+    global user_info
+    """Handles user messages and filters trials in real-time."""
     data = request.json
     user_response = data.get("message")
-    # session = data.get("session")  # Stores previous responses + remaining trials
+    # if "condition" not in user_info:
+    #     user_info["condition"]=1
+    #     return jsonify({"response": "What specific condition are you looking for (e.g., heart disease, cancer)?"})
 
-    # If this is a new session, fetch all trials
-    print(user_response)
-    if not user_session:
-        user_session = {
+    # Initialize or load session
+    if user_session["session_data"] == {}:
+        user_session["session_data"] = {
             "previous_responses": [],
-            "remaining_trials": list(mongo.db.trails.find({}, {"_id": 0}))
+            "remaining_trials": list(range(len(TRIAL_DATA)))
         }
-    trials = user_session["remaining_trials"]
-    previous_responses = user_session["previous_responses"]
+    session_data = user_session["session_data"]
 
-    # Store user response for context
+    previous_responses = session_data["previous_responses"]
+    remaining_trials = session_data["remaining_trials"]
     previous_responses.append(user_response)
 
-    # Dynamically filter trials based on the latest response
-    filtered_trials = filter_trials(trials, user_response)
+    # Filter trials in real-time
+    filtered_trials = filter_trials(remaining_trials, user_response, previous_responses)
 
     # Update session
-    user_session["remaining_trials"] = filtered_trials
-    user_session["previous_responses"] = previous_responses
+    session_data["remaining_trials"] = filtered_trials
+    session_data["previous_responses"] = previous_responses
+    user_session["session_data"] = session_data # Ensure session updates
 
-    # If only one trial remains, return it
+    # Check termination conditions
     if len(filtered_trials) == 1:
-        user_session.clear()
-        location = filtered_trials[0].get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])
-        return jsonify({"response": "Best matching trial found!",
-                        "geoPoints": [[location[0].get("geoPoint",{}).get("lat",0),location[0].get("geoPoint",{}).get("lon",0)]] ,
-                        "facilities": [location[0]]})
+        trial = TRIAL_DATA[filtered_trials[0]]
+        location = trial.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])
+        user_session["session_data"]= {}
+        user_info={}
+        return jsonify({
+            "response": "Best matching trial found!",
+            "geoPoints": [[location[0].get("geoPoint", {}).get("lat", 0), location[0].get("geoPoint", {}).get("lon", 0)]],
+            "facilities": [location[0]]
+        })
 
-    # If no trials remain, restart the process
     if not filtered_trials:
-        user_session.clear()
+        user_session["session_data"]= {}
+        user_info = {}
         return jsonify({"response": "No matching trials found. Please restart the conversation."})
 
-    # Generate the next question using Cohere based on updated trials + past responses
+    # Generate next question
     next_question = generate_sub_questions(filtered_trials, previous_responses)
+    return jsonify({"response": next_question})
 
-    return jsonify({"response": next_question, "session": user_session})
+def filter_trials(remaining_trials, user_response, previous_responses):
+    """Filters trials using semantic similarity and all original filters."""
+    # Embed user response
+    full_context = " ".join(previous_responses)
+    # Add input_type="search_query" for user input
+    user_embedding = co.embed(texts=[full_context], model="embed-english-v3.0", input_type="classification").embeddings[0]
+    user_embedding = np.array(user_embedding).reshape(1, -1)
+    filtered_indices = []
+    for idx in remaining_trials:
+        trial = TRIAL_DATA[idx]
+        trial_embedding = np.array(TRIAL_EMBEDDINGS[str(idx)]).reshape(1, -1)
+        similarity = cosine_similarity(user_embedding, trial_embedding)
+        # Get trial condition text for fuzzy matching fallback
 
+        # Check similarity or fuzzy match for spelling tolerance
+        # fuzzy_match = fuzz.partial_ratio(user_response.lower(), trial_conditions) > 70
+        # Apply semantic threshold and all original filters
+        if similarity[0][0] > 0.40 :
+            filtered_indices.append(idx)
 
+    return filtered_indices
 
-from rapidfuzz import fuzz
+def generate_sub_questions(filtered_trials, previous_responses):
+    """Generate a question based on missing user info or trial data."""
+    global user_info
+    trials = [TRIAL_DATA[i] for i in filtered_trials[:]]  # Limit to first 5 for brevity
 
-def filter_trials(trials, user_response):
-    """Filters clinical trials dynamically based on multiple conditions from the dataset."""
-    filtered_trials = []
-
-    for trial in trials:
-        condition_match = match_condition(trial, user_response)
-        age_match = check_age_eligibility(trial, user_response)
-        gender_match = check_gender_eligibility(trial, user_response)
-        health_status_match = check_health_status_eligibility(trial, user_response)
-        location_match = check_location(trial, user_response)
-        recruitment_match = check_recruitment_status(trial, user_response)
-        intervention_match = check_intervention(trial, user_response)
-        study_type_match = check_study_type(trial, user_response)
-        sponsor_match = check_sponsor(trial, user_response)
-        expanded_access_match = check_expanded_access(trial, user_response)
-        genetic_study_match = check_genetic_study(trial, user_response)
-        sample_size_match = check_sample_size(trial, user_response)
-        fda_regulated_match = check_fda_regulation(trial, user_response)
-
-        if any([
-            condition_match, age_match, gender_match, health_status_match, location_match, recruitment_match,
-            intervention_match, study_type_match, sponsor_match, expanded_access_match, genetic_study_match,
-            sample_size_match, fda_regulated_match
-        ]):
-            filtered_trials.append(trial)
-
-    return filtered_trials
-
-
-def match_condition(trial, user_response):
-    """Fuzzy match user input with trial condition names and related diseases."""
-    conditions = trial.get("protocolSection", {}).get("conditionsModule", {}).get("conditions", [])
-    browse_terms = trial.get("protocolSection", {}).get("derivedSection", {}).get("conditionBrowseModule", {}).get("browseLeaves", [])
-
-    all_terms = set(' '.join(conditions).split(' '))
-    all_terms.update([term["name"] for term in browse_terms])
-
-    user_words = set(user_response.lower().split())
-    match_count = sum(1 for term in all_terms for word in user_words if fuzz.ratio(term.lower(), word) >= 80)
-
-    return match_count >= 1  # Ensure at least 1 word matches for accuracy
-
-
-def check_age_eligibility(trial, user_response):
-    """Checks if user age matches the trial eligibility criteria."""
-    if user_response.isdigit():
-        user_age = int(user_response)
-        min_age = trial.get("protocolSection", {}).get("eligibilityModule", {}).get("minimumAge", "0 Years").split()[0]
-        max_age = trial.get("protocolSection", {}).get("eligibilityModule", {}).get("maximumAge", "999 Years").split()[0]
-
-        min_age = int(min_age) if min_age.isdigit() else 0
-        max_age = int(max_age) if max_age.isdigit() else 999
-
-        return min_age <= user_age <= max_age
-
-    return False
-
-
-def check_gender_eligibility(trial, user_response):
-    """Checks if user gender matches the trial eligibility criteria."""
-    gender = trial.get("protocolSection", {}).get("eligibilityModule", {}).get("gender", "").lower()
-    return user_response.lower() in gender
-
-
-def check_health_status_eligibility(trial, user_response):
-    """Checks if user health status matches the trial eligibility criteria."""
-    health_status = trial.get("protocolSection", {}).get("eligibilityModule", {}).get("healthStatus", "").lower()
-    return user_response.lower() in health_status
-
-
-def check_location(trial, user_response):
-    """Checks if user location matches the trial's location."""
-    locations = trial.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])
-
-    for loc in locations:
-        if any(user_response.lower() in loc[field].lower() for field in ["city", "state", "country"] if field in loc):
-            return True
-    return False
-
-
-def check_recruitment_status(trial, user_response, threshold=80):
-    """Filters trials based on recruitment status using fuzzy matching."""
-    recruitment_status = trial.get("protocolSection", {}).get("statusModule", {}).get("overallStatus", "").lower()
-    user_response = user_response.lower()
-
-    statuses = ["recruiting", "enrolling", "completed"]
-
-    for status in statuses:
-        if fuzz.partial_ratio(user_response, status) >= threshold and fuzz.partial_ratio(recruitment_status, status) >= threshold:
-            return True
-
-    return False
-
-
-def check_intervention(trial, user_response):
-    """Filters trials based on intervention type (e.g., gene therapy, drug, biological)."""
-    interventions = trial.get("protocolSection", {}).get("armsInterventionsModule", {}).get("interventions", [])
-
-    for intervention in interventions:
-        intervention_type = intervention.get("type", "").lower()
-        intervention_name = intervention.get("name", "").lower()
-
-        if user_response.lower() in intervention_type or user_response.lower() in intervention_name:
-            return True
-    return False
-
-
-def check_study_type(trial, user_response):
-    """Filters trials based on study type (e.g., observational, interventional)."""
-    study_type = trial.get("protocolSection", {}).get("designModule", {}).get("studyType", "").lower()
-
-    if user_response.lower() in study_type:
-        return True
-    return False
-
-
-def check_sponsor(trial, user_response):
-    """Filters trials based on sponsor or organization name."""
-    sponsor = trial.get("protocolSection", {}).get("sponsorCollaboratorsModule", {}).get("leadSponsor", {}).get("name", "").lower()
-
-    if user_response.lower() in sponsor:
-        return True
-    return False
-
-
-def check_expanded_access(trial, user_response):
-    """Filters trials based on whether they offer expanded access."""
-    has_expanded_access = trial.get("protocolSection", {}).get("statusModule", {}).get("expandedAccessInfo", {}).get("hasExpandedAccess", False)
-
-    return "expanded access" in user_response.lower() and has_expanded_access
-
-
-def check_genetic_study(trial, user_response):
-    """Filters trials that involve genetic studies or DNA samples."""
-    bio_spec = trial.get("protocolSection", {}).get("designModule", {}).get("bioSpec", {}).get("retention", "").lower()
-
-    return "dna" in user_response.lower() or "genetic" in bio_spec
-
-
-def check_sample_size(trial, user_response):
-    """Filters trials based on the estimated number of enrolled participants."""
-    if user_response.isdigit():
-        user_sample_size = int(user_response)
-        trial_enrollment = trial.get("protocolSection", {}).get("designModule", {}).get("enrollmentInfo", {}).get("count", 0)
-
-        return user_sample_size <= trial_enrollment
-
-    return False
-
-
-def check_fda_regulation(trial, user_response):
-    """Filters trials that are regulated by the FDA."""
-    is_fda_regulated = trial.get("protocolSection", {}).get("oversightModule", {}).get("isFdaRegulatedDrug", False)
-
-    return "fda regulated" in user_response.lower() and is_fda_regulated
-
-
-def generate_sub_questions(trials, previous_responses):
-    """Generates sub-questions for each chunk of trials."""
-    # sub_questions = []
+    # Prioritize missing key info
     #
-    # for chunk in trials:
-    #     chunk = str(chunk)[0:4081]
+    # if "age" not in user_info:
+    #     user_info["age"]=1
+    #     return "How old are you?"
+    # if "location" not in user_info:
+    #     user_info["location"]=1
+    #     return "Where are you located (e.g., city or country)?"
+
+    # If all key info is provided, ask a refining question based on trials
     context = f"""
-    Given the following clinical trials: {trials}
+    You are an intelligent clinical medical chatbot that helps users find the most relevant clinical trials.  
+    Your goal is to **ask step-by-step filtering questions** to narrow down the available trials based on the user's responses.  
+    
+    Behavior:  
+    1. **Acknowledge the user’s request** and provide the total number of matching trials.  
+    2. **Ask one relevant filtering question at a time** to refine the results.  
+    3. **Ensure each question is unique and not repeated** based on previous responses.  
+    4. if the trails count for every 2 times is same   then ask the question  that diffferiate the trails 
+    5. **Continue refining** until the list is small enough to present the final trials.  
+    
+    Example Flow:  
+    User: "I am looking for clinical trials for lung cancer treatment."  
+    Chatbot: "Got it! There are 120 trials currently available. Let's narrow it down. Are you looking for trials for yourself or someone else?"  
+    
+    User: "For myself."  
+    Chatbot: "Thanks. Based on that, we now have 85 trials that might match your case. Could you please share your age?"  
+    
+    User: "I am 62 years old."  
+    Chatbot: "Noted. That brings us to 40 available trials. Are you currently receiving any treatment for lung cancer, such as chemotherapy or immunotherapy?"  
+    
+    User: "I just finished chemotherapy last month."  
+    Chatbot: "Understood. Now we have 12 trials that match your current treatment stage. Would you be willing to travel for a clinical trial, or do you prefer locations nearby?"  
+    
+    User: "I prefer trials within 100 miles of my location."  
+    Chatbot: "Got it. Now we have 5 clinical trials available within 100 miles. Here’s a list of trials that match your criteria:"  
+    
+    Task:  
+    - Given the remaining **{trials}** and the user's previous responses **{previous_responses}**, generate the next best **filtering question** that has not been asked yet.  
+    - The question should **help refine** the results further in a natural, engaging, and structured way.  
+    - **Just return the question.**  
 
-    The user has provided these responses so far: {previous_responses}
 
-    Generate a relevant question to refine the selection further.
     """
+    try:
+        response = co.generate(model="command", prompt=context, max_tokens=50, truncate="START")
+        return response.generations[0].text.strip()
+    except cohere.errors.TooManyRequestsError:
+        print("Rate limit hit, waiting 60 seconds...")
+        time.sleep(60)
+        response = co.generate(model="command", prompt=context, max_tokens=50, truncate="START")
+        return response.generations[0].text.strip()
 
-    response = co.generate(
-        model="command",
-        prompt=context,
-        max_tokens=50,
-        truncate="START"
-    )
-
-    return  response.generations[0].text.strip()
-
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
-
-
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
