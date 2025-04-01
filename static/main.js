@@ -31,6 +31,8 @@ function sendMessage() {
 
             // Initialize the map with geoPoints
             setTimeout(() => {
+                console.log(document.getElementById("map"));
+                document.getElementById("map").style.display = "block";
                 initMap(data.geoPoints);
             }, 100);
         } else {
