@@ -1,117 +1,119 @@
+
+
 import json
-
-from flask import Flask, render_template, request, jsonify, session
-from flask_pymongo import PyMongo
-import cohere
+import openai
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 import time
-import re
 
+import thefuzz.fuzz
+from flask import Flask, render_template, request, jsonify
+from flask_pymongo import PyMongo
+from sklearn.metrics.pairwise import cosine_similarity
+import thefuzz as fuzz
 app = Flask(__name__)
 
-
-# Initialize Cohere API
-co = cohere.Client('O1jRnF6ABMam4G5KRsMlKfH7qJDFypv13nLiPuMz')
+# OpenAI API Key
+openai.api_key = "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"
 
 # MongoDB Connection
 app.config["MONGO_URI"] = "mongodb://localhost:27017/clinicalTrails"
 mongo = PyMongo(app)
-
-# Precompute trial embeddings (run this once or on app startup)
+client = openai.OpenAI(api_key="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")
+# Precompute trial embeddings
 TRIAL_EMBEDDINGS = {}
 TRIAL_DATA = list(mongo.db.trails.find({}, {"_id": 0}))
 
+def get_openai_embedding(text):
+    """Get embeddings from OpenAI."""
+    if len(text) > 8192:
+        text = text[:8192]  # Truncate to fit model limit
+    response = openai.embeddings.create(
+        model="text-embedding-ada-002",
+        input=text
+    )
+    return response.data[0].embedding
 
 
-
+def getEligibilityCriteriaForBatch(trail_batch):
+    eligibility_criteria = []
+    for trail in trail_batch:
+        eligibility = trail.get("protocolSection", {}).get("eligibilityModule", {})
+        eligibility_criteria.append(eligibility.get("eligibilityCriteria", ""))
+    return eligibility_criteria
 def precompute_trial_embeddings():
     global TRIAL_EMBEDDINGS, TRIAL_DATA
-    batch_size = 10  # Process 10 trials per API call
+    batch_size = 50  # Process 10 trials per API call
 
-    try :
-        with open("trail_embedding.json","r") as f:
+    try:
+        with open("trial_embedding_eligibility.json", "r") as f:
             TRIAL_EMBEDDINGS = json.load(f)
-            f.close()
-    except Exception as e:
+    except Exception:
         for i in range(0, len(TRIAL_DATA), batch_size):
-            batch = TRIAL_DATA[i:i + batch_size]
-            texts = []
-            print("batch Processing ...." , i)
-            for trial in batch:
-                text = " ".join([
-                    # " ".join(trial.get("protocolSection", {}).get("conditionsModule", {}).get("conditions", [])),
-                    # trial.get("protocolSection", {}).get("eligibilityModule", {}).get("gender", ""),
-                    # trial.get("protocolSection", {}).get("statusModule", {}).get("overallStatus", ""),
-                    # " ".join([loc.get("city", "") + " " + loc.get("country", "") for loc in trial.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])])
-                    str(trial)
-                ])
-                texts.append(text if text.strip() else "unknown")  # Handle empty text
-
+            batch = getEligibilityCriteriaForBatch(TRIAL_DATA[i:i + batch_size])
+            texts = [str(trial) for trial in batch]
+            print("Batch "+str(i)+ " is processing .......")
             try:
-                embeddings = co.embed(texts=texts, model="embed-english-v3.0", input_type="classification").embeddings
+                embeddings = [get_openai_embedding(text) for text in texts]
                 for j, embedding in enumerate(embeddings):
                     TRIAL_EMBEDDINGS[i + j] = embedding
-            except cohere.errors.TooManyRequestsError:
+            except openai.RateLimitError:
                 print("Rate limit hit, waiting 60 seconds...")
-                time.sleep(60)  # Wait 1 minute to reset rate limit
-                embeddings = co.embed(texts=texts, model="embed-english-v3.0", input_type="search_document").embeddings
+                time.sleep(60)
+                embeddings = [get_openai_embedding(text) for text in texts]
                 for j, embedding in enumerate(embeddings):
                     TRIAL_EMBEDDINGS[i + j] = embedding
 
-            time.sleep(1.5)  # ~40 calls/minute = 1 call every 1.5 seconds
+            time.sleep(1.5)
         print(f"Precomputed embeddings for {len(TRIAL_DATA)} trials")
 
-
 precompute_trial_embeddings()
-# with open("trail_embedding.json", "w+") as f:
+# with open("trial_embedding_eligibility.json", "w+") as f:
 #     f.write(json.dumps(TRIAL_EMBEDDINGS))
 #     f.close()
-
-
-user_info={}
-user_session ={"session_data":{}}
-# Routes
+user_session = {"session_data": {}}
+user_info =[]
+user_set_questions={}
+next_question=""
 @app.route('/')
 def chat():
     return render_template('chat.html')
 
 @app.route('/send_message', methods=['POST'])
 def send_message():
-    global user_info
+    global user_info,user_set_questions,next_question
     """Handles user messages and filters trials in real-time."""
     data = request.json
     user_response = data.get("message")
-    # if "condition" not in user_info:
-    #     user_info["condition"]=1
-    #     return jsonify({"response": "What specific condition are you looking for (e.g., heart disease, cancer)?"})
+    if "condition" not in user_info:
+        user_info.append("condition")
+        next_question="What specific condition are you looking for (e.g., heart disease, Covid 19,Breast Cancer)?"
+        return jsonify({"response":next_question })
 
-    # Initialize or load session
     if user_session["session_data"] == {}:
         user_session["session_data"] = {
             "previous_responses": [],
             "remaining_trials": list(range(len(TRIAL_DATA)))
         }
     session_data = user_session["session_data"]
-
+    user_response = str(user_response).lower()
     previous_responses = session_data["previous_responses"]
     remaining_trials = session_data["remaining_trials"]
     previous_responses.append(user_response)
+    filtered_trials = []
+    if len(previous_responses)==1:
+        filtered_trials = getDiseaseTrails(previous_responses[0])
+    else:
+        filtered_trials = filter_trials(remaining_trials, user_response, previous_responses)
 
-    # Filter trials in real-time
-    filtered_trials = filter_trials(remaining_trials, user_response, previous_responses)
-
-    # Update session
     session_data["remaining_trials"] = filtered_trials
     session_data["previous_responses"] = previous_responses
-    user_session["session_data"] = session_data # Ensure session updates
+    user_session["session_data"] = session_data
 
-    # Check termination conditions
     if len(filtered_trials) == 1:
         trial = TRIAL_DATA[filtered_trials[0]]
         location = trial.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])
-        user_session["session_data"]= {}
-        user_info={}
+        user_session["session_data"] = {}
+        user_info=[]
         return jsonify({
             "response": "Best matching trial found!",
             "geoPoints": [[location[0].get("geoPoint", {}).get("lat", 0), location[0].get("geoPoint", {}).get("lon", 0)]],
@@ -119,93 +121,101 @@ def send_message():
         })
 
     if not filtered_trials:
-        user_session["session_data"]= {}
-        user_info = {}
+        user_info=[]
+        user_session["session_data"] = {}
         return jsonify({"response": "No matching trials found. Please restart the conversation."})
-
-    # Generate next question
-    next_question = generate_sub_questions(filtered_trials, previous_responses)
+    user_set_questions[next_question] = user_response
+    next_question = generate_sub_questions(filtered_trials, user_set_questions)
     return jsonify({"response": next_question})
 
+def getDiseaseTrails(disease):
+
+    listitems = []
+    disease_words = set(disease.lower().split())  # Convert disease to lowercase and split into words
+
+    for i in range(len(TRIAL_DATA)):
+        conditions = TRIAL_DATA[i].get("protocolSection",{}).get("conditionsModule",{}).get("conditions",[])
+        for j in conditions:
+            condition_words = set(j.lower().split())  # Convert condition to lowercase and split into words
+
+            # Check for a fuzzy match (threshold 80%)
+            if any(fuzz.fuzz.ratio(word1, word2) >= 80 for word1 in disease_words for word2 in condition_words):
+                print(disease, j)
+                listitems.append(i)
+                break  # Exit inner loop once a match is found
+
+    return listitems
+
+
 def filter_trials(remaining_trials, user_response, previous_responses):
-    """Filters trials using semantic similarity and all original filters."""
-    # Embed user response
-    full_context = " ".join(previous_responses)
-    # Add input_type="search_query" for user input
-    user_embedding = co.embed(texts=[full_context], model="embed-english-v3.0", input_type="classification").embeddings[0]
-    user_embedding = np.array(user_embedding).reshape(1, -1)
-    filtered_indices = []
-    for idx in remaining_trials:
-        trial = TRIAL_DATA[idx]
-        trial_embedding = np.array(TRIAL_EMBEDDINGS[str(idx)]).reshape(1, -1)
-        similarity = cosine_similarity(user_embedding, trial_embedding)
-        # Get trial condition text for fuzzy matching fallback
+    """Filters trials using semantic similarity."""
+    # Get user embedding (assuming get_openai_embedding is available)
+    user_embedding = np.array(get_openai_embedding(previous_responses)).reshape(1, -1)
 
-        # Check similarity or fuzzy match for spelling tolerance
-        # fuzzy_match = fuzz.partial_ratio(user_response.lower(), trial_conditions) > 70
-        # Apply semantic threshold and all original filters
-        if similarity[0][0] > 0.40 :
-            filtered_indices.append(idx)
+    # Compute cosine similarities
+    similarities = [
+        (idx, cosine_similarity(user_embedding, np.array(TRIAL_EMBEDDINGS[str(idx)]).reshape(1, -1))[0][0])
+        for idx in remaining_trials
+    ]
 
-    return filtered_indices
+    # Extract raw similarity scores
+    scores = np.array([sim for _, sim in similarities])
+
+    # Normalize scores to [0, 1] range for consistency
+    if scores.max() != scores.min():
+        normalized_scores = (scores - scores.min()) / (scores.max() - scores.min())
+    else:
+        normalized_scores = np.ones_like(scores) * 0.5  # Default to neutral if all scores are identical
+
+    scaling_factor = 20
+    probabilities = 1 / (1 + np.exp(-scaling_factor * (normalized_scores - 0.5)))
+
+    # Sort by probability (descending)
+    trial_probs = [(idx, prob) for (idx, _), prob in zip(similarities, probabilities)]
+    trial_probs.sort(key=lambda x: x[1], reverse=True)
+
+    mean_score = np.mean(probabilities)
+    std_dev = np.std(probabilities)
+
+    # Use mean + std deviation for a dynamic cutoff
+    threshold = min(0.8, mean_score + (0.5 * std_dev))
+
+    filtered_trials = [idx for idx, prob in trial_probs if prob >= threshold]
+
+    return filtered_trials
+
+def getElibilityCriteria(trail_data):
+    eligibility = trail_data.get("protocolSection", {}).get("eligibilityModule", {})
+    inclusion_criteria = eligibility.get("eligibilityCriteria", "")
+    return inclusion_criteria
 
 def generate_sub_questions(filtered_trials, previous_responses):
-    """Generate a question based on missing user info or trial data."""
-    global user_info
-    trials = [TRIAL_DATA[i] for i in filtered_trials[:]]  # Limit to first 5 for brevity
-
-    # Prioritize missing key info
-    #
-    # if "age" not in user_info:
-    #     user_info["age"]=1
-    #     return "How old are you?"
-    # if "location" not in user_info:
-    #     user_info["location"]=1
-    #     return "Where are you located (e.g., city or country)?"
-
-    # If all key info is provided, ask a refining question based on trials
+    """Generates next filtering question using OpenAI GPT."""
+    trials = [getElibilityCriteria(TRIAL_DATA[i]) for i in filtered_trials][:25]
     context = f"""
-    You are an intelligent clinical medical chatbot that helps users find the most relevant clinical trials.  
-    Your goal is to **ask step-by-step filtering questions** to narrow down the available trials based on the user's responses.  
-    
-    Behavior:  
-    1. **Acknowledge the user’s request** and provide the total number of matching trials.  
-    2. **Ask one relevant filtering question at a time** to refine the results.  
-    3. **Ensure each question is unique and not repeated** based on previous responses.  
-    4. if the trails count for every 2 times is same   then ask the question  that diffferiate the trails 
-    5. **Continue refining** until the list is small enough to present the final trials.  
-    
-    Example Flow:  
-    User: "I am looking for clinical trials for lung cancer treatment."  
-    Chatbot: "Got it! There are 120 trials currently available. Let's narrow it down. Are you looking for trials for yourself or someone else?"  
-    
-    User: "For myself."  
-    Chatbot: "Thanks. Based on that, we now have 85 trials that might match your case. Could you please share your age?"  
-    
-    User: "I am 62 years old."  
-    Chatbot: "Noted. That brings us to 40 available trials. Are you currently receiving any treatment for lung cancer, such as chemotherapy or immunotherapy?"  
-    
-    User: "I just finished chemotherapy last month."  
-    Chatbot: "Understood. Now we have 12 trials that match your current treatment stage. Would you be willing to travel for a clinical trial, or do you prefer locations nearby?"  
-    
-    User: "I prefer trials within 100 miles of my location."  
-    Chatbot: "Got it. Now we have 5 clinical trials available within 100 miles. Here’s a list of trials that match your criteria:"  
-    
-    Task:  
-    - Given the remaining **{trials}** and the user's previous responses **{previous_responses}**, generate the next best **filtering question** that has not been asked yet.  
-    - The question should **help refine** the results further in a natural, engaging, and structured way.  
-    - **Just return the question.**  
-
-
+        "You are a medical chatbot helping users find clinical trials. "
+        "Given the list of eligibility criteria: \n" + {trials} + "\n"
+        "Ask a specific, relevant filtering question based on the eligibility criteria "
+        "that has not been asked before. Keep it concise. \n"
+        f"Trial Count: {len(filtered_trials)}\n"
+        f"Past Questions: {previous_responses}\n"
+        "Return only the next question with Trail Count also in the question  {len(filtered_trials)}."
     """
+
     try:
-        response = co.generate(model="command", prompt=context, max_tokens=50, truncate="START")
-        return response.generations[0].text.strip()
-    except cohere.errors.TooManyRequestsError:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": context}]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exception:
         print("Rate limit hit, waiting 60 seconds...")
         time.sleep(60)
-        response = co.generate(model="command", prompt=context, max_tokens=50, truncate="START")
-        return response.generations[0].text.strip()
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": context}]
+        )
+        return response.choices[0].message.content.strip()
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
