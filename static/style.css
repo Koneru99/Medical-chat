@@ -1,120 +1,160 @@
-let map;
+/* Reset some default styles */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
 
-function sendMessage() {
-    const userInput = document.getElementById("user-input").value;
-    if (userInput.trim() === "") return;
-
-    // Append user's message to chat box
-    const chatBox = document.getElementById("chat-box");
-    chatBox.innerHTML += `<div class="message user-message">You: ${userInput}</div>`;
-
-    // Scroll chatbox down as messages come in
-    chatBox.scrollTop = chatBox.scrollHeight;
-
-    // Send user message to the Flask server
-    fetch('/send_message', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ message: userInput }),
-    })
-    .then(response => response.json())
-    .then(data => {
-        // Append server's response to the chat box
-        chatBox.innerHTML += `<div class="message bot-message">Bot: ${data.response}</div>`;
-        
-        // Check if geoPoints are included in the response
-        if (data.geoPoints && data.geoPoints.length) {
-            // Append the map directly to the chat box
-            chatBox.innerHTML += `<div id="map" style="display: block; width: 100%; height: 400px; margin-top: 20px;"></div>`;
-
-            // Initialize the map with geoPoints
-            setTimeout(() => {
-                console.log(document.getElementById("map"));
-                document.getElementById("map").style.display = "block";
-                initMap(data.geoPoints);
-            }, 100);
-        } else {
-            console.log("No geo points received from the backend.");
-        }
-        
-        if (data.facilities && data.facilities.length > 0) {
-            data.facilities.forEach(facility => {
-                let facilityInfo = `<div class="facility-info" style="margin-top: 20px;">`;
-        
-                if (facility.facility) {
-                    facilityInfo += `<h4>${facility.facility}</h4>`;
-                }
-        
-                if (facility.status) {
-                    facilityInfo += `<p>Status: ${facility.status}</p>`;
-                }
-        
-                if (facility.city || facility.state || facility.zip || facility.country) {
-                    facilityInfo += `<p>Location: ${facility.city || ''}, ${facility.state || ''} ${facility.zip || ''}, ${facility.country || ''}</p>`;
-                }
-        
-                if (facility.contacts && facility.contacts.length > 0) {
-                    const contact = facility.contacts[0]; // Assuming you want only the first contact
-                    facilityInfo += `<h5>Contact Information:</h5>`;
-        
-                    if (contact.name) {
-                        facilityInfo += `<p>Name: ${contact.name}</p>`;
-                    }
-        
-                    if (contact.role) {
-                        facilityInfo += `<p>Role: ${contact.role}</p>`;
-                    }
-        
-                    if (contact.phone) {
-                        facilityInfo += `<p>Phone: ${contact.phone}</p>`;
-                    }
-        
-                    if (contact.email) {
-                        facilityInfo += `<p>Email: <a href="mailto:${contact.email}">${contact.email}</a></p>`;
-                    }
-                }
-        
-                facilityInfo += `</div>`;
-                chatBox.innerHTML += facilityInfo;
-            });
-        }
-        
-        // Scroll down as new messages come in
-        chatBox.scrollTop = chatBox.scrollHeight;
-    })
-    .catch(error => {
-        console.error('Error sending message:', error);
-    });
-
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f5f5f5; /* Light gray background */
+    color: #333; /* Dark gray text color */
+    background-image: url("backgroundImage.jpg"); /* Set your background image */
+    background-size: contain;
+    background-position: center; /* Center the image */
+    height: 100vh; /* Full height */
+    margin: 0;
     
-
-    // Clear input field
-    document.getElementById("user-input").value = "";
 }
 
-function initMap(geoPoints) {
-    // Create the map centered on the first geo-point
-    map = new google.maps.Map(document.getElementById("map"), {
-        zoom: 8,
-        center: { lat: geoPoints[0][0], lng: geoPoints[0][1] },
-    });
-
-    // Add markers for each geo-point
-    geoPoints.forEach(point => {
-        new google.maps.Marker({
-            position: { lat: point[0], lng: point[1] },
-            map: map,
-        });
-    });
-
-    // Optionally adjust the map's bounds to fit all markers
-    adjustMapBounds(geoPoints);
+/* Chat Container */
+.chat-container {
+    width: 100%; /* Full width */
+    max-width: 600px; /* Maximum width for larger screens */
+    height: 100%; /* Full height of the viewport */
+    max-height: 90%; /* Responsive design, limit height to 90% of viewport */
+    margin: 5% auto; /* Center the chat container horizontally */
+    background-color: rgba(255, 255, 255, 0.9); /* White background with slight transparency */
+    border-radius: 8px; /* Rounded corners */
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.2); /* Subtle shadow */
+    overflow: hidden; /* Hide overflow */
 }
 
-function adjustMapBounds(geoPoints) {
-    const bounds = new google.maps.LatLngBounds();
-    geoPoints.forEach(point => bounds.extend(new google.maps.LatLng(point[0], point[1])));
-    map.fitBounds(bounds);
+.facility-info {
+    border: 1px solid #ccc;
+    padding: 10px;
+    margin-top: 20px;
+    background-color: #f9f9f9;
+}
+
+.facility-info h4 {
+    font-size: 18px;
+    color: #333;
+}
+
+.facility-info p {
+    font-size: 14px;
+    color: #555;
+}
+
+.facility-info a {
+    color: #0066cc;
+    text-decoration: none;
+}
+
+.facility-info a:hover {
+    text-decoration: underline;
+}
+
+#map {
+    width: 100%;
+    min-height: 400px;
+    display: block !important;
+    margin-top: 20px;
+}
+
+
+
+/* Chat Box */
+.chat-box {
+    display: flex;
+    overflow: visible;
+    /*justify-content: space-between;*/
+    height: 100%; /* Increased height for the chat box */
+    flex-direction: column;
+    overflow-y: auto; /* Enable vertical scrolling */
+    padding: 70px; /* Inner padding */
+    border-bottom: 2px solid #ececec; /* Divider line */
+    transition: background-color 0.3s ease; /* Smooth transition for background color */
+}
+
+/* Input Container */
+.input-container {
+    display: flex; /* Flexbox for input and button alignment */
+    padding: 10px; /* Inner padding */
+    background-color: #f9f9f9; /* Light gray background */
+}
+
+/* User Input */
+#user-input {
+    flex: 1; /* Allow input to grow */
+    padding: 10px; /* Inner padding */
+    border: 1px solid #ccc; /* Light gray border */
+    border-radius: 4px; /* Rounded corners */
+    font-size: 16px; /* Font size */
+    margin-right: 10px; /* Space between input and button */
+    transition: border-color 0.3s; /* Transition for border color */
+}
+
+#user-input:focus {
+    outline: none; /* Remove outline on focus */
+    border-color: #007BFF; /* Blue border on focus */
+}
+
+/* Button */
+button {
+    padding: 10px 15px; /* Inner padding */
+    background-color: #007BFF; /* Blue background */
+    color: white; /* White text */
+    border: none; /* No border */
+    border-radius: 4px; /* Rounded corners */
+    cursor: pointer; /* Pointer cursor on hover */
+    font-size: 16px; /* Font size */
+    transition: background-color 0.3s, transform 0.2s; /* Transition effects */
+}
+
+button:hover {
+    background-color: #0056b3; /* Darker blue on hover */
+    transform: scale(1.05); /* Slightly enlarge on hover */
+}
+
+.message {
+    display: flex;
+    margin-bottom: 10px;
+    padding: 8px;
+    border-radius: 4px;
+    opacity: 0;
+    transform: translateY(10px);
+    animation: fadeIn 0.5s forwards;
+    flex-direction: column;
+}
+
+@keyframes fadeIn {
+    to {
+        opacity: 1; /* Fade to fully visible */
+        transform: translateY(0); /* Move to original position */
+    }
+}
+
+.user-message {
+    background-color: #d1e7dd; /* Light green */
+    padding: 10px;
+    border-radius: 8px;
+    max-width: 45%;
+    align-self: flex-end;
+}
+
+.bot-message {
+    background-color: #f8d7da; /* Light red */
+    padding: 10px;
+    border-radius: 8px;
+    max-width: 45%;
+    align-self: flex-start;
+}
+
+/* Media Queries for Responsiveness */
+@media (max-width: 650px) {
+    .chat-container {
+        width: 90%; /* Full width on small screens */
+    }
 }
