@@ -13,12 +13,11 @@ import thefuzz as fuzz
 app = Flask(__name__)
 
 # OpenAI API Key
-openai.api_key = "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"
-
+openai.api_key = "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"
 # MongoDB Connection
 app.config["MONGO_URI"] = "mongodb://localhost:27017/clinicalTrails"
 mongo = PyMongo(app)
-client = openai.OpenAI(api_key="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")
+client = openai.OpenAI(api_key="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")
 # Precompute trial embeddings
 TRIAL_EMBEDDINGS = {}
 TRIAL_DATA = list(mongo.db.trails.find({}, {"_id": 0}))
@@ -126,7 +125,13 @@ def send_message():
         return jsonify({"response": "No matching trials found. Please restart the conversation."})
     user_set_questions[next_question] = user_response
     next_question = generate_sub_questions(filtered_trials, user_set_questions)
-    return jsonify({"response": next_question})
+    locations =[]
+    for i in filtered_trials:
+        trial = TRIAL_DATA[i]
+        location = trial.get("protocolSection", {}).get("contactsLocationsModule", {}).get("locations", [])
+        locations.append([location[0].get("geoPoint", {}).get("lat", 0), location[0].get("geoPoint", {}).get("lon", 0)])
+
+    return jsonify({"response": next_question,"geoPoints": locations})
 
 def getDiseaseTrails(disease):
 
@@ -139,7 +144,7 @@ def getDiseaseTrails(disease):
             condition_words = set(j.lower().split())  # Convert condition to lowercase and split into words
 
             # Check for a fuzzy match (threshold 80%)
-            if any(fuzz.fuzz.ratio(word1, word2) >= 80 for word1 in disease_words for word2 in condition_words):
+            if any(fuzz.fuzz.ratio(word1, word2) >= 60 for word1 in disease_words for word2 in condition_words):
                 print(disease, j)
                 listitems.append(i)
                 break  # Exit inner loop once a match is found
@@ -191,7 +196,7 @@ def getElibilityCriteria(trail_data):
 
 def generate_sub_questions(filtered_trials, previous_responses):
     """Generates next filtering question using OpenAI GPT."""
-    trials = [getElibilityCriteria(TRIAL_DATA[i]) for i in filtered_trials][:25]
+    trials = [getElibilityCriteria(TRIAL_DATA[i]) for i in filtered_trials][:9]
     context = f"""
         "You are a medical chatbot helping users find clinical trials. "
         "Given the list of eligibility criteria: \n" + {trials} + "\n"
@@ -199,18 +204,18 @@ def generate_sub_questions(filtered_trials, previous_responses):
         "that has not been asked before. Keep it concise. \n"
         f"Trial Count: {len(filtered_trials)}\n"
         f"Past Questions: {previous_responses}\n"
-        "Return only the next question with Trail Count also in the question  {len(filtered_trials)}."
+        "Return only the next question with also mentioning the Trail Count like this no of trails are remaining  in the question  {len(filtered_trials)}."
     """
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4-turbo",
             messages=[{"role": "system", "content": context}]
         )
         return response.choices[0].message.content.strip()
     except Exception as exception:
         print("Rate limit hit, waiting 60 seconds...")
-        time.sleep(60)
+        print(exception)
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "system", "content": context}]
