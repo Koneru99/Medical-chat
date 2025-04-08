@@ -1,5 +1,5 @@
 let map;
-
+let isMap=true
 function sendMessage() {
     const userInput = document.getElementById("user-input").value;
     if (userInput.trim() === "") return;
@@ -27,7 +27,9 @@ function sendMessage() {
         // Check if geoPoints are included in the response
         if (data.geoPoints && data.geoPoints.length) {
             // Append the map directly to the chat box
-            chatBox.innerHTML += `<div id="map" style="display: block; width: 100%; height: 400px; margin-top: 20px;"></div>`;
+                chatBox.innerHTML += `<div id="map" style="display: block; width: 100%; height: 400px; margin-top: 20px;"></div>`;
+                isMap=false;
+
 
             // Initialize the map with geoPoints
             setTimeout(() => {
@@ -77,6 +79,7 @@ function sendMessage() {
                 }
         
                 facilityInfo += `</div>`;
+                isMap=true
                 chatBox.innerHTML += facilityInfo;
             });
         }
